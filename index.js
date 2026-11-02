@@ -60,6 +60,7 @@ if (process.env.MC_ON_JOIN_COMMANDS) {
     throw new Error("MC_ON_JOIN_COMMANDS must be a JSON array of commands");
   }
 }
+config.discord.webhookUrl = process.env.DISCORD_WEBHOOK_URL || config.discord.webhookUrl;
 if (!config.server.ip || !config["bot-account"].username) {
   throw new Error("Set MC_SERVER_HOST and MC_BOT_USERNAME before starting the bot");
 }
@@ -476,6 +477,7 @@ app.get("/tutorial", (req, res) => {
               <li>Use a server that you own or are authorized to access.</li>
               <li>Grant the bot account operator permissions from the server console if you want it to change game mode and teleport.</li>
               <li>Adjust the configured teleport coordinate to match your Minecraft version and world.</li>
+              <li>The default <code>/vanish</code> command needs a compatible server-side vanish plugin to hide the bot from the tab list.</li>
             </ol>
           </div>
 
@@ -486,7 +488,8 @@ app.get("/tutorial", (req, res) => {
             </div>
             <ol>
               <li>Download this project as a ZIP and extract it.</li>
-              <li>Set <code>MC_SERVER_HOST</code> and <code>MC_BOT_USERNAME</code> as environment variables.</li>
+              <li>Set the server, bot username, dashboard password, and <code>DISCORD_WEBHOOK_URL</code> as environment variables.</li>
+              <li>Create the Discord webhook in the channel where you want the audit records; the webhook URL selects that channel.</li>
               <li>Upload all files to a new <strong>GitHub Repository</strong>.</li>
             </ol>
           </div>
@@ -499,6 +502,7 @@ app.get("/tutorial", (req, res) => {
             <ol>
               <li>Create a Blueprint from this repository using <code>render.yaml</code>.</li>
               <li>Set the server host, bot username, and dashboard password when prompted.</li>
+              <li>Set <code>DISCORD_WEBHOOK_URL</code> to the private webhook URL for your audit channel.</li>
               <li>Deploy the web service; it serves the dashboard and connects the bot.</li>
               <li>Render's free web services may sleep. Use an always-on plan for a persistent connection.</li>
             </ol>
@@ -983,7 +987,7 @@ app.get("/logs", (req, res) => {
               .then(function(r) { return r.json(); })
               .then(function(data) {
                 if (data.msg) {
-                  data.msg.split('\\n').forEach(function(line) {
+                  data.msg.split('\n').forEach(function(line) {
                     appendLocalEntry(line, data.success ? 'default' : 'error');
                   });
                 }
@@ -1169,8 +1173,10 @@ function clearBotTimeouts() {
 }
 
 // FIX: Discord rate limiting - track last send time
-let lastDiscordSend = 0;
-const DISCORD_RATE_LIMIT_MS = 5000; // min 5s between webhook calls
+const discordQueue = [];
+let discordQueueTimer = null;
+let discordRequestActive = false;
+const DISCORD_SEND_INTERVAL_MS = 1100;
 
 function clearAllIntervals() {
   addLog(`[Cleanup] Clearing ${activeIntervals.length} intervals`);
@@ -1285,7 +1291,7 @@ function createBot() {
         config.discord.events.connect
       ) {
         sendDiscordWebhook(
-          `[+] **Connected** to \`${config.server.ip}\``,
+          `[+] **Bot joined:** \`${config["bot-account"].username}\` on \`${config.server.ip}\``,
           0x4ade80,
         );
       }
@@ -1299,6 +1305,29 @@ function createBot() {
       defaultMove.fallDamageCost = 1000;
 
       initializeModules(bot, mcData, defaultMove);
+
+      // Mineflayer's playerJoined/playerLeft events describe server presence;
+      // seed the set at spawn so existing players do not get duplicate welcomes.
+      const connectedPlayerNames = new Set(Object.keys(bot.players || {}));
+      bot.on("playerJoined", (player) => {
+        const username = player && player.username;
+        if (!botState.connected || !username || username === bot.username || connectedPlayerNames.has(username)) return;
+        connectedPlayerNames.add(username);
+        if (config.discord.events.playerJoin) {
+          sendDiscordWebhook(`🟢 **Player joined:** ${username}`, 0x3fb950);
+        }
+        if (config.discord.enabled && config.discord.webhookUrl) {
+          bot.chat(`Welcome, ${username}! I'm the server bot. Public chat is recorded in the server's Discord log. Private messages like /msg, /tell, and /whisper are not recorded.`);
+        }
+      });
+      bot.on("playerLeft", (player) => {
+        const username = player && player.username;
+        if (!botState.connected || !username || username === bot.username || !connectedPlayerNames.has(username)) return;
+        connectedPlayerNames.delete(username);
+        if (config.discord.events.playerLeave) {
+          sendDiscordWebhook(`🔴 **Player left:** ${username}`, 0xf85149);
+        }
+      });
 
       // Commands run as the configured bot account. Grant its permissions
       // through your server console before enabling privileged commands here.
@@ -1362,7 +1391,7 @@ function createBot() {
         config.discord.events &&
         config.discord.events.disconnect
       ) {
-        sendDiscordWebhook(`[!] **Kicked**: ${kickReason}`, 0xff0000);
+        sendDiscordWebhook(`[!] **Bot kicked:** ${config["bot-account"].username} — ${kickReason}`, 0xff0000);
       }
       // NOTE: do NOT call scheduleReconnect() here - 'end' will fire right after 'kicked' and handle it
     });
@@ -1380,7 +1409,7 @@ function createBot() {
         config.discord.events.disconnect
       ) {
         sendDiscordWebhook(
-          `[-] **Disconnected**: ${reason || "Unknown"}`,
+          `[-] **Bot left:** ${config["bot-account"].username} — ${reason || "Unknown reason"}`,
           0xf87171,
         );
       }
@@ -1949,64 +1978,93 @@ rl.on("line", (line) => {
 });
 
 // ============================================================
-// DISCORD WEBHOOK INTEGRATION
-// FIX: use Buffer.byteLength for Content-Length (handles non-ASCII usernames correctly)
-// FIX: rate limiting to avoid spam when bot is flapping
+// DISCORD AUDIT WEBHOOK
+// Queue events instead of dropping chat when the webhook is rate-limited.
 // ============================================================
 function sendDiscordWebhook(content, color = 0x0099ff) {
-  if (
-    !config.discord ||
-    !config.discord.enabled ||
-    !config.discord.webhookUrl ||
-    config.discord.webhookUrl.includes("YOUR_DISCORD")
-  )
-    return;
+  if (!config.discord?.enabled || !config.discord.webhookUrl) return;
+  discordQueue.push({ content: String(content), color, timestamp: new Date(), attempts: 0 });
+  processDiscordQueue();
+}
 
-  // FIX: Discord rate limiting - skip if sent too recently
-  const now = Date.now();
-  if (now - lastDiscordSend < DISCORD_RATE_LIMIT_MS) {
-    addLog("[Discord] Rate limited - skipping webhook");
-    return;
-  }
-  lastDiscordSend = now;
+function processDiscordQueue(delayMs = 0) {
+  if (discordRequestActive || discordQueueTimer || discordQueue.length === 0) return;
 
-  const protocol = config.discord.webhookUrl.startsWith("https") ? https : http;
-  const urlParts = new URL(config.discord.webhookUrl);
+  discordQueueTimer = setTimeout(() => {
+    discordQueueTimer = null;
+    const item = discordQueue.shift();
+    let urlParts;
+    try {
+      urlParts = new URL(config.discord.webhookUrl);
+      if (!["https:", "http:"].includes(urlParts.protocol)) throw new Error("Unsupported protocol");
+    } catch (err) {
+      addLog(`[Discord] Invalid webhook URL: ${err.message}`);
+      processDiscordQueue(DISCORD_SEND_INTERVAL_MS);
+      return;
+    }
 
-  const payload = JSON.stringify({
-    username: config.name,
-    embeds: [
-      {
-        description: content,
-        color: color,
-        timestamp: new Date().toISOString(),
-        footer: { text: "Slobos AFK Bot" },
+    const payload = JSON.stringify({
+      username: config.name,
+      allowed_mentions: { parse: [] },
+      embeds: [{
+        description: item.content.slice(0, 4000),
+        color: item.color,
+        timestamp: item.timestamp.toISOString(),
+        footer: { text: "Minecraft server audit log" },
+      }],
+    });
+    const protocol = urlParts.protocol === "https:" ? https : http;
+    const request = protocol.request({
+      hostname: urlParts.hostname,
+      port: urlParts.port || (urlParts.protocol === "https:" ? 443 : 80),
+      path: urlParts.pathname + urlParts.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload, "utf8"),
       },
-    ],
-  });
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("end", () => {
+        discordRequestActive = false;
+        if (response.statusCode === 429) {
+          let retryAfter = Number(response.headers["retry-after"]) * 1000;
+          if (!Number.isFinite(retryAfter) || retryAfter <= 0) {
+            try { retryAfter = Number(JSON.parse(body).retry_after) * 1000; } catch (_) {}
+          }
+          discordQueue.unshift(item);
+          processDiscordQueue(Math.max(1000, retryAfter || DISCORD_SEND_INTERVAL_MS));
+          return;
+        }
+        if ((response.statusCode === 408 || response.statusCode >= 500) && item.attempts < 5) {
+          item.attempts += 1;
+          discordQueue.unshift(item);
+          addLog(`[Discord] HTTP ${response.statusCode}; retry ${item.attempts}/5`);
+          processDiscordQueue(DISCORD_SEND_INTERVAL_MS);
+          return;
+        }
+        if (response.statusCode >= 400) addLog(`[Discord] Webhook returned HTTP ${response.statusCode}`);
+        processDiscordQueue(DISCORD_SEND_INTERVAL_MS);
+      });
+    });
 
-  const options = {
-    hostname: urlParts.hostname,
-    port: 443,
-    path: urlParts.pathname + urlParts.search,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      // FIX: use Buffer.byteLength instead of payload.length - handles non-ASCII (e.g. usernames with accents/emoji)
-      "Content-Length": Buffer.byteLength(payload, "utf8"),
-    },
-  };
-
-  const req = protocol.request(options, (res) => {
-    // Silent success
-  });
-
-  req.on("error", (e) => {
-    addLog(`[Discord] Error sending webhook: ${e.message}`);
-  });
-
-  req.write(payload);
-  req.end();
+    discordRequestActive = true;
+    request.setTimeout(15000, () => request.destroy(new Error("Webhook request timed out")));
+    request.on("error", (err) => {
+      discordRequestActive = false;
+      item.attempts += 1;
+      if (item.attempts <= 5) {
+        discordQueue.unshift(item);
+        addLog(`[Discord] Send failed; retry ${item.attempts}/5: ${err.message}`);
+      } else {
+        addLog(`[Discord] Giving up on one event after retries: ${err.message}`);
+      }
+      processDiscordQueue(DISCORD_SEND_INTERVAL_MS);
+    });
+    request.end(payload);
+  }, delayMs);
 }
 
 // ============================================================

@@ -7,9 +7,9 @@ services:
     startCommand: npm start
     envVars:
       - key: MC_SERVER_HOST
-        sync: false
+        value: gemsmps.joinmc.world
       - key: MC_SERVER_PORT
-        value: "25565"
+        value: "27637"
       - key: MC_SERVER_VERSION
         value: ""
       - key: MC_BOT_USERNAME
@@ -21,4 +21,6 @@ services:
       - key: MC_BOT_AUTH
         value: offline
       - key: MC_ON_JOIN_COMMANDS
-        value: '["/gamemode spectator","/tp @s 0 -65 0"]'
+        value: '["/vanish","/gamemode spectator","/tp @s 0 -65 0"]'
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
