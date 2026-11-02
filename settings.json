@@ -6,8 +6,8 @@
     "type": "offline"
   },
   "server": {
-    "ip": "",
-    "port": 25565,
+    "ip": "gemsmps.joinmc.world",
+    "port": 27637,
     "version": "",
     "try-creative": false
   },
