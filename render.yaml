@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: minecraft-afk-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MC_SERVER_HOST
+        sync: false
+      - key: MC_SERVER_PORT
+        value: "25565"
+      - key: MC_SERVER_VERSION
+        value: ""
+      - key: MC_BOT_USERNAME
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: DASHBOARD_USER
+        value: admin
+      - key: MC_BOT_AUTH
+        value: offline
+      - key: MC_ON_JOIN_COMMANDS
+        value: '["/gamemode spectator","/tp @s 0 -65 0"]'
